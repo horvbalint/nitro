@@ -10,7 +10,9 @@ import {
   type CallExpression,
   type Identifier,
 } from "acorn";
-import { traverse, type NodePath } from "estree-toolkit";
+// import { traverse, type NodePath } from "estree-toolkit";
+import { walk } from "estree-walker";
+import {analyze} from "eslint-scope"
 import MagicString from "magic-string";
 import { createJiti } from "jiti";
 
@@ -63,35 +65,41 @@ export function handlersMeta(nitro: Nitro) {
       let meta: NitroEventHandler["meta"] | null = null;
 
       try {
+        const filePath = id.slice(virtualPrefix.length);
         const ext = extname(id) as keyof typeof esbuildLoaders;
+
         const jsCode = await transform(code, {
           loader: esbuildLoaders[ext],
         }).then((r) => r.code);
+
         const ast = parse(jsCode, {
-          ecmaVersion: "latest", // REVIEW: is this ok?
+          ecmaVersion: 2022, // REVIEW: is this ok?
           sourceType: "module",
+          locations: true,
+          sourceFile: filePath,
+          ranges: true,
         });
+
+        const scopeManager = analyze(ast, {'sourceType': 'module', 'ecmaVersion': 2022});
 
         const nodesToKeep = new Set<AnyNode>();
-        traverse(ast, {
-          $: { scope: true },
-          ExpressionStatement(path) {
-            if (isDefineRouteMeta(path.node! as ExpressionStatement)) {
-              nodesToKeep.add(path.node! as ExpressionStatement);
-              path.traverse(getIdentityVisitor(nodesToKeep), {
-                traversingFrom: path,
-              });
+        walk(ast, {
+          enter(node) {
+            if(isDefineRouteMeta(node)) {
+              nodesToKeep.add(node);
+              processIdentifiers(node, nodesToKeep, scopeManager)
             }
-          },
+          }
         });
+        console.log(nodesToKeep)
 
-        const filePath = id.slice(virtualPrefix.length);
         const dirPath = dirname(filePath);
         const routeMetaFile = generateRouteMetaFile(
           dirPath,
           jsCode,
           nodesToKeep
         );
+        // console.log(routeMetaFile)
 
         const { default: routeMeta } = await jiti.evalModule(routeMetaFile, {filename: filePath}) as {default: NitroRouteMeta | null};
 
@@ -142,52 +150,6 @@ function generateRouteMetaFile(
   });
 
   return codeParts.join("\n\n");
-}
-
-type TraverseState = {
-  traversingFrom: NodePath;
-};
-
-function getIdentityVisitor<T extends AnyNode>(
-  nodesToKeep: Set<AnyNode>
-): Parameters<typeof traverse<T, TraverseState>>[1] {
-  return {
-    $: {
-      scope: true,
-    },
-    Identifier(path, state) {
-      if (
-        path.node!.name === "defineRouteMeta" || // defineRouteMeta won't have a binding
-        isNotReferencePosition(
-          path.node as Identifier,
-          path.parent as AnyNode | null
-        )
-      )
-        return;
-
-      // check if the identifier is relevant and if so, find its declaration and traverse it if not already traversed
-      if (path.isDescendantOf(state.traversingFrom)) {
-        const binding = path.scope!.getBinding(path.node!.name);
-        if (!binding || binding.path.isDescendantOf(state.traversingFrom))
-          return;
-
-        const rootParent = binding.path.find(
-          (p) => p.parent?.type === "Program"
-        );
-        if (!rootParent)
-          throw new Error(
-            `No root level parent found for binding: ${path.node?.name}`
-          );
-
-        if (!nodesToKeep.has(rootParent.node! as AnyNode)) {
-          nodesToKeep.add(rootParent.node! as AnyNode);
-          rootParent.traverse(getIdentityVisitor(nodesToKeep), {
-            traversingFrom: rootParent,
-          });
-        }
-      }
-    },
-  };
 }
 
 type DefineRouteMetaExpression = ExpressionStatement & {
@@ -323,4 +285,53 @@ function getPatternIdentifiers(pattern: AnyNode) {
   collectIdentifiers(pattern);
 
   return identifiers;
+}
+
+function processIdentifiers(traversingFrom: AnyNode, nodesToKeep: Set<AnyNode>, scopeManager: ScopeManager) {
+  console.log(scopeManager.acquire(traversingFrom))
+
+  walk(traversingFrom, {
+    enter(node, parent) {
+      if (
+        node.type !== 'Identifier' ||
+        node.name === "defineRouteMeta" || // defineRouteMeta won't have a binding
+        isNotReferencePosition(
+          node as Identifier,
+          parent as AnyNode | null
+        )
+      )
+        return;
+
+      console.log("HOLA", node)
+
+      const scope = scopeManager.acquire(node);
+      if(!scope) return;
+      isDescendantOf(scope, traversingFrom!)
+
+      // check if the identifier is relevant and if so, find its declaration and traverse it if not already traversed
+      const binding = scope.variables.find(v => v.name === node.name)
+      if (!binding || isDescendantOf(binding.scope, traversingFrom!))
+        return;
+
+      const rootParent = getRootParent(scope)
+      if (!nodesToKeep.has(rootParent.block)) {
+        nodesToKeep.add(rootParent.block);
+        processIdentifiers(rootParent.block, nodesToKeep, scopeManager)
+      }
+    }
+  })
+}
+
+function isDescendantOf(scope: Scope, ancestor: AnyNode) {
+  if(scope.upper.block === ancestor)
+    return true
+  else
+    return scope.upper && isDescendantOf(scope.upper, ancestor)
+}
+
+function getRootParent(scope: Scope) {
+  if(!scope.upper || scope.upper.block.type === 'Program')
+    return scope
+  else
+    return getRootParent(scope.upper)
 }
